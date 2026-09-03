@@ -20,11 +20,11 @@ describe('Feishu release notes pipeline', () => {
   interface FixtureCommit {
     message: string
     date: string
-    tag?: string
+    tag?: string | string[]
   }
 
-  /** A throwaway git repo with a known commit + tag graph, HEAD left untagged. */
-  function buildTagFixtureRepo(commits: FixtureCommit[]): string {
+  /** A throwaway git repo with a known commit + tag graph. */
+  function buildTagFixtureRepo(commits: FixtureCommit[], annotated = false): string {
     const dir = mkdtempSync(join(tmpdir(), 'feishu-tags-'))
     fixtureRepos.push(dir)
     const git = (args: string[], extraEnv: Record<string, string> = {}): void => {
@@ -47,7 +47,12 @@ describe('Feishu release notes pipeline', () => {
       writeFileSync(join(dir, 'file.txt'), `${message}\n`)
       git(['add', '.'])
       git(['commit', '-q', '-m', message], { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date })
-      if (tag) git(['tag', tag])
+      const tags = Array.isArray(tag) ? tag : tag ? [tag] : []
+      for (const name of tags) {
+        git(annotated ? ['tag', '-a', name, '-m', `Release ${name}`] : ['tag', name], {
+          GIT_COMMITTER_DATE: date
+        })
+      }
     }
     return dir
   }
@@ -175,12 +180,17 @@ Description here.
   it(
     'builds a prerelease prompt with previous tag and prerelease notices',
     () => {
+      const repo = buildTagFixtureRepo([
+        { message: 'stable work', date: '2026-02-01T00:00:00Z', tag: 'v0.7.1' },
+        { message: 'prerelease cut', date: '2026-03-01T00:00:00Z', tag: ['0.7.2', 'v0.7.2'] }
+      ], true)
       const output = execFileSync(
         'python3',
         [scriptPath, 'build-prompt', '--tag', '0.7.2', '--prerelease'],
         {
           encoding: 'utf8',
-          env: pythonEnv
+          env: pythonEnv,
+          cwd: repo
         }
       )
 
@@ -189,6 +199,11 @@ Description here.
       expect(output).toContain('⚠️ 本次为预发布版本，供测试与体验使用。')
       expect(output).toContain('⚠️ This is a pre-release version for testing and preview.')
       expect(output).toContain('Previous tag: v0.7.1')
+      expect(output).not.toContain('Previous tag: v0.7.2')
+      expect(output).not.toContain('Previous tag: 0.7.2')
+      expect(output).toContain('Verified range: v0.7.1..0.7.2')
+      expect(output).toContain('Subject: prerelease cut')
+      expect(output).toContain('+prerelease cut')
     },
     pythonTestTimeoutMs
   )
@@ -221,6 +236,70 @@ Description here.
 
     // Future official v0.8.0 on HEAD: must skip the 0.7.2 prerelease and pick v0.7.1.
     expect(buildPrompt(['--tag', 'v0.8.0'])).toContain('Previous stable tag: v0.7.1')
+  })
+
+  it.each(['lightweight', 'annotated'])('excludes all same-commit aliases for %s tags', (kind) => {
+    const repo = buildTagFixtureRepo([
+      { message: 'previous release', date: '2026-01-01T00:00:00Z', tag: 'v1.9.0' },
+      { message: 'current release', date: '2026-02-01T00:00:00Z', tag: ['2.0.0', 'v2.0.0', 'v1.9.1'] }
+    ], kind === 'annotated')
+    const buildPrompt = (args: string[]): string =>
+      execFileSync('python3', [scriptPath, 'build-prompt', ...args], {
+        encoding: 'utf8',
+        env: pythonEnv,
+        cwd: repo
+      })
+
+    const prerelease = buildPrompt(['--tag', '2.0.0', '--prerelease'])
+    expect(prerelease).toContain('Previous tag: v1.9.0')
+    expect(prerelease).toContain('Verified range: v1.9.0..2.0.0')
+
+    const stable = buildPrompt(['--tag', 'v2.0.0'])
+    expect(stable).toContain('Previous stable tag: v1.9.0')
+    expect(stable).toContain('Verified range: v1.9.0..v2.0.0')
+
+    // An unpublished target falls back to HEAD, whose aliases still cannot bound a diff.
+    const unpublished = buildPrompt(['--tag', '2.1.0-rc.1', '--prerelease'])
+    expect(unpublished).toContain('Previous tag: v1.9.0')
+    expect(unpublished).toContain('Verified range: v1.9.0..HEAD')
+  })
+
+  it.each([
+    { scenario: 'no tags', tag: '0.1.0', prerelease: true, tags: [], previous: undefined },
+    { scenario: 'root aliases', tag: '0.1.0', prerelease: true, tags: ['0.1.0', 'v0.1.0'], previous: undefined },
+    { scenario: 'non-version history', tag: '0.1.0', prerelease: true, tags: ['0.1.0'], previous: 'preview-only' },
+    { scenario: 'no stable history', tag: 'v0.1.0', prerelease: false, tags: ['0.1.0', 'v0.1.0'], previous: '0.0.1-rc.1' }
+  ])('keeps Unavailable when there is no eligible predecessor: $scenario', ({ tag, prerelease, tags, previous }) => {
+    const commits: FixtureCommit[] = []
+    if (previous) commits.push({ message: 'earlier work', date: '2026-01-01T00:00:00Z', tag: previous })
+    commits.push({ message: 'initial release', date: '2026-02-01T00:00:00Z', tag: tags })
+    const repo = buildTagFixtureRepo(commits, true)
+    const output = execFileSync('python3', [scriptPath, 'build-prompt', '--tag', tag, ...(prerelease ? ['--prerelease'] : [])], {
+      encoding: 'utf8',
+      env: pythonEnv,
+      cwd: repo
+    })
+
+    expect(output).toContain(`${prerelease ? 'Previous tag' : 'Previous stable tag'}: Unavailable`)
+    expect(output.split(/\r?\n/)).toContain(`- Verified range: ${tag}`)
+    expect(output).toContain('Subject: initial release')
+    expect(output).toContain('+initial release')
+  })
+
+  it('preserves creation-date ordering among eligible previous tags', () => {
+    const repo = buildTagFixtureRepo([
+      { message: 'earlier release', date: '2026-01-01T00:00:00Z', tag: 'v1.9.0' },
+      { message: 'later maintenance release', date: '2026-02-01T00:00:00Z', tag: 'v1.8.1' },
+      { message: 'current release', date: '2026-03-01T00:00:00Z', tag: 'v2.0.0' }
+    ], true)
+    const output = execFileSync('python3', [scriptPath, 'build-prompt', '--tag', 'v2.0.0'], {
+      encoding: 'utf8',
+      env: pythonEnv,
+      cwd: repo
+    })
+
+    expect(output).toContain('Previous stable tag: v1.8.1')
+    expect(output).toContain('Verified range: v1.8.1..v2.0.0')
   })
 
   it('integrates Feishu release notification into GitHub Actions workflow', () => {

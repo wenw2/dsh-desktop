@@ -199,3 +199,58 @@ Actual:   Previous tag: v0.7.2
 - 没有切换分支、创建提交、推送或创建 PR；没有改代码、CSS、品牌源文件、package.json、lockfile 或 patches。
 
 `node_modules/` 和 `out/` 是既有安装/构建命令生成的忽略目录，不计作产品源码修改。Dev 数据创建已在第 4 节单独记录。代码检查结果来自文档生成前的未修改基线；新增 Markdown 后不将文档检查冒充重新执行全部应用测试。
+
+## Post-baseline remediation
+
+修复日期：2026-09-03（Australia/Sydney）。这是后续单独授权的 previous-tag 修复，**不改变上文原始审计时 668 passed / 1 failed 的历史结果**。
+
+### 起点与根因
+
+- 开始前依次运行 `git status`、`git branch --show-current`、`git rev-parse HEAD`：工作区干净，分支 `product/foundation`，HEAD 为 `0f9e76d5d98b069ddb0fd53ce3ee427ab0a7f9b1`。
+- 本轮确认 Node v24.15.0、npm 11.12.1、Python 3.9.6、Git 2.50.1（Apple Git-155）；复用已安装依赖，没有重新安装或升级。
+- 原失败用例的 CLI 目标是 `0.7.2`，而不是 `v0.7.2`。只读 `git for-each-ref` 确认二者是不同的 annotated tag 对象，但都解引用到 `11481ac3827d75f98c8ceca3771f63cbfa2a49f0`；较晚创建的 `v0.7.2` 被原选择器优先选中。
+- `find_previous_tag()` 只排除完全同名的 tag，未排除同提交别名；原用例未指定 fixture cwd，又把前序 tag 固定为 `v0.7.1`。实现缺陷与测试对真实仓库 refs 的依赖共同导致失败。
+
+### 确认的语义与最小修复
+
+依据 `.github/scripts/feishu_release_notes.py` 的候选规则、现有通道测试，以及 `.github/workflows/release.yml` 的正式发布 / `publish-prerelease` 调用：
+
+- previous tag 必须指向目标 ref 的**严格祖先提交**，符合当前发布通道的候选格式；目标 tag 本身及同提交的其他 tag 均不能作为前序边界。目标不存在时继续使用 HEAD。
+- 正式版保持仅选择 `vX.Y.Z`；预发布保持现有可选 `v` 与版本后缀的 regex。保留创建时间降序及既有 version-refname 排序 fallback；不是新增“全仓库最大旧 SemVer”或“图距离最近 tag”的规则。
+- 实现只在两处 `git tag --merged ref` 查询各增加 `--no-contains ref`，另加一行说明，共新增 5 行。Git 的可达性过滤同时处理 lightweight / annotated tags，无版本号硬编码、无新依赖。
+- 无有效前序 tag 时仍返回空字符串；CLI 继续显示 `Unavailable`，使用既有单 ref 证据回退。没有把净 code diff 必须非空变成新策略，合法的 empty commit / revert 仍可有空净差异。
+- `github_release_notes.py` 共享此采证函数，因此一并运行其现有测试；未修改 workflow、客户端更新逻辑或任何 Harness patch。
+
+### 回归覆盖
+
+保留原失败用例的全部断言，复用临时 Git fixture，增加同提交 `0.7.2` / `v0.7.2`，并断言正确范围与 fixture 中的实际 commit / diff 内容。先只改测试，确认同一错误仍然变红，再修复实现并确认转绿。
+
+新增 7 个参数化展开后的用例：
+
+- lightweight / annotated 两种 tag：正式版、预发布均排除当前提交所有别名，包括名称不同的版本 tag；目标尚未建立时的 HEAD fallback 也排除该提交上的 tags。
+- 4 种无有效前序情形：没有 tags、根提交仅有当前版本别名、历史只有非版本 tag、正式发布之前只有 prerelease tag。均保持 `Unavailable` 与原证据回退。
+- 有效前序候选继续按创建时间选择，不意外变成按版本数值取最大值。
+
+原有正常顺序、正式 / 预发布区分和未创建目标 tag 的测试保留。前序选择回归均在独立临时仓库运行，fixture 固定提交/标签日期，建库时屏蔽全局/系统 Git 配置，并由既有 `afterEach` 清理；没有更改真实仓库 tags。
+
+复核发现新增的范围断言固定 LF，已改为兼容 LF / CRLF 的完整 metadata 行匹配，保留精确范围要求；随后重新依次运行目标文件、完整测试、typecheck、build。本轮实际运行环境为 macOS，没有宣称 Windows CI 已验证。
+
+### 本轮实际验证
+
+| 实际命令 / 阶段 | 真实结果 |
+| --- | --- |
+| `npm test -- test/feishu-release-notes.test.ts -t 'builds a prerelease prompt with previous tag and prerelease notices'`（未修改实现、原测试） | exit 1；1 failed / 6 skipped；Expected v0.7.1，Actual v0.7.2 |
+| 同一命令（只隔离 fixture 并加强断言，尚未修复实现） | exit 1；1 failed / 6 skipped；相同错误，证明回归能检出缺陷 |
+| 同一命令（5 行实现修复后） | exit 0；1 passed / 6 skipped；skipped 来自 `-t` 筛选，没有删除或跳过任何用例 |
+| `npm test -- test/feishu-release-notes.test.ts test/github-release-notes.test.ts`（全部回归补齐后） | exit 0；2 files / 18 tests 全部通过；Duration 4.50s |
+| `python3 .github/scripts/feishu_release_notes.py build-prompt --tag 0.7.2 --prerelease`（真实仓库，只显示筛选后的 metadata） | exit 0；Previous tag v0.7.1；Current tag 0.7.2；Verified range v0.7.1..0.7.2 |
+| `npm test -- test/feishu-release-notes.test.ts`（换行兼容调整后的最终目标测试） | exit 0；1 file / 14 tests 全部通过；Duration 4.34s |
+| `npm test`（获准使用本地端口监听权限，换行调整前后各一次） | 两次均 exit 0；**80 files / 676 tests 全部通过**；Duration 分别 5.71s / 5.62s；均未报告 unhandled errors |
+| `npm run typecheck`（换行调整前后各一次） | 两次均 exit 0 |
+| `npm run build`（换行调整前后各一次） | 两次均 exit 0；197 / 7 modules；保留既有 `(!) renderer config is missing` 警告 |
+| `git status`、`git diff`（首轮验证后、本节首次追加前） | 仅发布说明脚本与对应测试两个文件未暂存修改；实现新增 5 行，原断言保留；无其他源码修改 |
+| 最终 `git status`、`git diff`、`git diff --check`、分支 / HEAD 核验与只读文档检查 | 仅本节文档、发布说明脚本、对应测试三个文件修改；无暂存和未跟踪文件；分支 / HEAD 未变；无空白错误；上文原审计内容逐字节保留 |
+
+完整测试中的 pnpm / Windows EPERM 输出仍来自既有负面测试，不是此次测试失败。本轮不运行发布、推送、签名、通知或真实 Agent 流程；测试和构建成功不代表已验证线上发布。
+
+最终结果：**修复后的自动测试基线已恢复全绿**。变更范围仅发布说明选择器、对应回归测试及本节追加记录。行为变化仅为不再使用目标提交上的 tag 形成自比较区间；共享该函数的 GitHub 发布说明采证也获得同样修正。没有切换/创建分支，没有提交、推送或创建 PR。

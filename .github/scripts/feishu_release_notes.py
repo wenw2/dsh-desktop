@@ -170,9 +170,12 @@ def find_previous_tag(release_tag: str, prerelease: bool = False) -> str:
     )
     pattern = SEMVER_TAG_PATTERN if prerelease else STABLE_TAG_PATTERN
     try:
+        # Only strict ancestors can bound a release diff; exclude all tags on ref itself.
         merged_tags = git_output(
             "tag",
             "--merged",
+            ref,
+            "--no-contains",
             ref,
             "--sort=-creatordate",
         ).splitlines()
@@ -183,6 +186,8 @@ def find_previous_tag(release_tag: str, prerelease: bool = False) -> str:
         merged_tags_ver = git_output(
             "tag",
             "--merged",
+            ref,
+            "--no-contains",
             ref,
             "--sort=-version:refname",
         ).splitlines()
